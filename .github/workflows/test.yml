@@ -1,0 +1,181 @@
+name: Run Tests
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:14-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: ptmrpostgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Set up Git for private repo access
+        run: |
+          git config --global url."https://${{ secrets.GH_TOKEN }}:@github.com/".insteadOf "https://github.com/"
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+
+      - name: Set GOPRIVATE
+        run: export GOPRIVATE=github.com/hankimmy/*
+
+      - name: Set up Go 1.x
+        uses: actions/setup-go@v2
+        with:
+          go-version: '1.22'
+        id: go
+
+      - name: Check out code into the Go module directory
+        uses: actions/checkout@v4
+
+      - name: Decode and write service account key to file
+        run: echo "${{ secrets.SERVICE_ACCOUNT_KEY }}" | base64 -d > ./cmd/UserService/serviceAccountKey.json
+
+      - name: Configure sysctl limits
+        run: |
+          sudo swapoff -a
+          sudo sysctl -w vm.swappiness=1
+          sudo sysctl -w fs.file-max=262144
+          sudo sysctl -w vm.max_map_count=262144
+
+      - name: Runs Elasticsearch
+        uses: elastic/elastic-github-actions/elasticsearch@master
+        with:
+          stack-version: 8.2.0
+          security-enabled: false
+
+      - name: Install golang-migrate
+        run: |
+          curl -L https://github.com/golang-migrate/migrate/releases/download/v4.14.1/migrate.linux-amd64.tar.gz | tar xvz
+          sudo mv migrate.linux-amd64 /usr/bin/migrate
+          which migrate
+
+      - name: Run migrations
+        run: migrate -path pkg/db/migration -database "postgresql://postgres:password@localhost:5432/ptmrpostgres?sslmode=disable"  -verbose up
+
+      - name: Wait for Elasticsearch to start and create index
+        run: |
+          echo "Waiting for Elasticsearch to start..."
+          sleep 10
+          until curl -s http://localhost:9200/_cluster/health | grep -q '"status":"green"'; do
+            echo "Waiting for Elasticsearch to be healthy..."
+            sleep 5
+          done
+          JOB_INDEX_MAPPING='
+          {
+            "mappings": {
+              "properties": {
+                "date_posted": {
+                  "type": "date",
+                  "format": "yyyy-MMMM-dd"
+                },
+                "job_location": { "type": "keyword" },
+                "employment_type": { "type": "keyword" },
+                "title": { "type": "text" },
+                "industry": { "type": "keyword" },
+                "wage": { "type": "half_float" },
+                "user_created": { "type": "boolean" },
+                "rating": { "type": "half_float" },
+                "price_level": { "type": "keyword" },
+                "requirements": { "type": "keyword" },
+                "opening_hours": {
+                  "type": "nested",
+                  "properties": {
+                    "close": {
+                      "type": "object",
+                      "properties": {
+                        "day": { "type": "integer" },
+                        "hour": { "type": "integer" },
+                        "minute": { "type": "integer" }
+                      }
+                    },
+                    "open": {
+                      "type": "object",
+                      "properties": {
+                        "day": { "type": "integer" },
+                        "hour": { "type": "integer" },
+                        "minute": { "type": "integer" }
+                      }
+                    }
+                  }
+                },
+                "precise_location": { "type": "geo_point" }
+              }
+            }
+          }
+          '
+          CANDIDATE_INDEX_MAPPING='
+          {
+            "mappings": {
+              "properties": {
+                "education": { "type": "keyword" },
+                "location": { "type": "text" },
+                "skill_set": { "type": "keyword" },
+                "certificates": { "type": "keyword" },
+                "time_availability": {
+                  "type": "nested",
+                  "properties": {
+                    "morning": { "type": "boolean" },
+                    "afternoon": { "type": "boolean" },
+                    "evening": { "type": "boolean" },
+                    "night": { "type": "boolean" }
+                  }
+                },
+                "account_verified": { "type": "boolean" },
+                "has_resume": {"type": "boolean" },
+                "rating": { "type": "integer" },
+                "past_experience": {
+                  "type": "nested",
+                  "properties": {
+                    "industry": { "type": "keyword" },
+                    "job_title": { "type": "text" },
+                    "length": { "type": "half_float" }
+                  }
+                }
+              }
+            }
+          }
+          '
+          APPLICATION_INDEX_MAPPING='
+          {
+            "mappings": {
+              "properties": {
+                "any_field": {
+                  "type": "text",
+                  "index": false  // Disable indexing
+                }
+              }
+            }
+          }
+          '
+          curl -X PUT "http://localhost:9200/jobs" -H 'Content-Type: application/json' -d "$JOB_INDEX_MAPPING"
+          curl -X PUT "http://localhost:9200/candidates" -H 'Content-Type: application/json' -d "$CANDIDATE_INDEX_MAPPING"
+          curl -X PUT "http://localhost:9200/candidate_applications" -H 'Content-Type: application/json' -d "$APPLICATION_INDEX_MAPPING"
+          curl -X PUT "http://localhost:9200/employer_applications" -H 'Content-Type: application/json' -d "$APPLICATION_INDEX_MAPPING"
+      - name: Package Test
+        run: SKIP_API_CALLS=true go test -v -cover -short ./...
+      - name: User Service Test
+        run: cd cmd/UserService; go test -v -cover -short ./...
+      - name: Application Service Test
+        run: cd cmd/ApplicationService; go test -v -cover -short ./...;
+      - name: Job Writer Service Test
+        run: cd cmd/JobWriter;  go test -v -cover -short ./...;
+      - name: Matching Service Test
+        run: cd cmd/MatchingService; go test -v -cover -short ./...;
